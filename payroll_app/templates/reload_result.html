@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}重装结果{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>数仓分区整组重装结果
+    <span class="badge open">已完成</span>
+  </h2>
+  <p class="hint">
+    预览编号 <span class="mono">{{ result.preview_id }}</span>
+    · 起点分区 <span class="mono">{{ result.root }}</span>
+    · 完成于 {{ result.confirmed_at }}
+  </p>
+  <div class="msg ok">
+    已在单事务内用对应已封账流水一次替换整组 {{ result.group|length }} 个分区：
+    {{ result.group | join('、') }}。任一分区写入失败都会整体回滚，本次全部成功。
+  </div>
+  <table>
+    <thead>
+      <tr><th>分区月份</th><th>重装前镜像条数</th><th>重装后条数（=封账流水）</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for r in result.replaced %}
+      <tr>
+        <td><a href="{{ url_for('month_detail', month=r.month) }}">{{ r.month }}</a></td>
+        <td class="num">{{ r.old_rows }}</td>
+        <td class="num">{{ r.new_rows }}</td>
+        <td><a class="btn small" href="{{ url_for('month_detail', month=r.month) }}">查看分区</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">
+    重装后各分区流水的“应入账月”均等于其所在分区，组内错投边已消除；
+    已封账本地账未做任何改动。
+  </p>
+  <p>
+    <a class="btn small" href="{{ url_for('index') }}">返回首页</a>
+  </p>
+</section>
+{% endblock %}

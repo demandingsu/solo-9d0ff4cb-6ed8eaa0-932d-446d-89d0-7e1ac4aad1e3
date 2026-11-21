@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}重装预览 {{ preview.preview_id[:8] }}{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>数仓分区整组重装预览
+    <span class="badge {{ 'closed' if preview.status != 'open' else 'open' }}">
+      {{ '可确认' if preview.status == 'open' and not block else
+         ('已确认' if preview.status == 'confirmed' else '已失效') }}
+    </span>
+  </h2>
+  <p class="hint">
+    预览编号 <span class="mono">{{ preview.preview_id }}</span>
+    · 起点分区 <span class="mono">{{ preview.root_month }}</span>
+    · 生成于 {{ preview.created_at }}
+    · 快照含 {{ preview.row_total }} 条镜像流水
+  </p>
+
+  {% if preview.status != 'open' %}
+    <div class="msg error">该预览已于 {{ preview.confirmed_at or '—' }} 执行，不能重复确认。</div>
+  {% elif block %}
+    {% if block[0] == 'stale' %}
+      <div class="msg error">预览已过期：{{ block[1] }}</div>
+    {% else %}
+      <div class="msg error">暂不满足重装条件：{{ block[1] }}</div>
+    {% endif %}
+  {% else %}
+    <div class="msg ok">预览与当前镜像一致：组内各分区均有对应的已封账月，可整组重装。</div>
+  {% endif %}
+
+  <h3>相连分区（双向追查结果，共 {{ group|length }} 个）</h3>
+  <table>
+    <thead>
+      <tr><th>分区月份</th><th>本地封账状态</th><th>快照载入代次</th><th>当前载入代次</th>
+          <th>快照流水数</th><th>校验</th></tr>
+    </thead>
+    <tbody>
+      {% for m in members %}
+      <tr>
+        <td><a href="{{ url_for('month_detail', month=m.month) }}">{{ m.month }}</a></td>
+        <td>
+          {% if m.book_status == 'closed' %}<span class="badge closed">已封账</span>
+          {% elif m.book_status == 'open' %}<span class="badge open">未封账</span>
+          {% else %}<span class="badge warn-badge">缺少对应月份</span>{% endif %}
+        </td>
+        <td class="num">{{ m.load_seq }}</td>
+        <td class="num">{{ m.current_seq }}</td>
+        <td class="num">{{ m.row_count }}</td>
+        <td>
+          {% if m.current_seq != m.load_seq %}
+            <span class="badge warn-badge">预览后已替换</span>
+          {% elif m.book_status != 'closed' %}
+            <span class="badge warn-badge">无可用封账流水</span>
+          {% else %}
+            <span class="badge open">就绪</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h3>组内错投流水（共 {{ edge_rows|length }} 条，连接分区的依据）</h3>
+  <table>
+    <thead>
+      <tr><th>实际分区</th><th>分区内#</th><th>应入账月</th><th>薪资单号</th>
+          <th>流水类型</th><th>成本中心</th><th>金额（分）</th><th>勘误号</th></tr>
+    </thead>
+    <tbody>
+      {% for r in edge_rows %}
+      <tr class="misroute">
+        <td class="mono">{{ r.partition_month }}</td>
+        <td class="num">{{ r.seq }}</td>
+        <td class="mono">{{ r.entry_month }}</td>
+        <td class="mono">{{ r.slip_no }}</td>
+        <td>{{ labels.get(r.kind, r.kind) }}</td>
+        <td class="mono">{{ r.cost_center }}</td>
+        <td class="num {{ 'neg' if r.amount_cents < 0 else '' }}">{{ r.amount_cents }}</td>
+        <td class="mono">{{ r.adjust_no or '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="empty">该分区没有错投流水，重装范围仅其自身</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="reload-actions">
+    <form method="post" action="{{ url_for('warehouse_reload', preview_id=preview.preview_id) }}"
+          class="inline"
+          onsubmit="return confirm('将用对应已封账流水一次替换整组 {{ group|length }} 个分区，确定继续？');">
+      <button type="submit" class="reload-btn"
+              {{ 'disabled' if preview.status != 'open' or block else '' }}>
+        确认整组重装
+      </button>
+    </form>
+    <a class="btn small" href="{{ url_for('month_detail', month=preview.root_month) }}">返回分区</a>
+    <a class="btn small" href="{{ url_for('index') }}">返回首页</a>
+  </div>
+  <p class="hint">
+    确认时会再次复核：分区缺少对应封账月、预览后组内分区被替换、组外分区被错投连入、或写入失败，
+    任一项不满足则整组保留原状并提示原因。
+  </p>
+</section>
+{% endblock %}

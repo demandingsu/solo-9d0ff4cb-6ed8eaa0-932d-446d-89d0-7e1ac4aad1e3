@@ -3,15 +3,23 @@
 {% block content %}
 <section class="card">
   <h2>{{ month }} 入账明细
-    <span class="badge {{ info.status }}">{{ '开放' if info.status == 'open' else '已封账' }}</span>
+    {% if info %}
+      <span class="badge {{ info.status }}">{{ '开放' if info.status == 'open' else '已封账' }}</span>
+    {% else %}
+      <span class="badge closed">仅数仓镜像</span>
+    {% endif %}
   </h2>
   <p class="hint">
-    {% if info.status == 'closed' %}
-      该月已封账，明细已锁定。后续勘误会在新的开放月生成“冲回 + 重入账”流水。
+    {% if info %}
+      {% if info.status == 'closed' %}
+        该月已封账，明细已锁定。后续勘误会在新的开放月生成“冲回 + 重入账”流水。
+      {% else %}
+        该月开放，可继续导入原单或提交勘误。
+      {% endif %}
+      · <a href="{{ url_for('export', month=month) }}">下载该月 CSV</a>
     {% else %}
-      该月开放，可继续导入原单或提交勘误。
+      本地账中没有该月份；下方是数仓镜像分区内容（可能是错投落入的流水）。
     {% endif %}
-    · <a href="{{ url_for('export', month=month) }}">下载该月 CSV</a>
   </p>
   <table>
     <thead>
@@ -31,7 +39,72 @@
         <td class="num">{{ r.revision }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="8" class="empty">该月没有流水</td></tr>
+      <tr><td colspan="8" class="empty">该月本地账没有流水</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>数仓镜像分区 · {{ month }}
+    {% if wh_info %}
+      <span class="badge {{ 'open' if wh_misroute_count == 0 else 'warn-badge' }}">
+        载入代次 {{ wh_info.load_seq }} · {{ wh_info.row_count }} 条
+        {% if wh_misroute_count %}· 错投 {{ wh_misroute_count }} 条{% endif %}
+      </span>
+    {% else %}
+      <span class="badge closed">镜像分区尚未载入</span>
+    {% endif %}
+  </h2>
+  <div class="grid two">
+    <form method="post" action="{{ url_for('warehouse_upload') }}" enctype="multipart/form-data">
+      <h3>上传数仓流水（整体替换该分区）</h3>
+      <label>实际落入月份
+        <input name="partition_month" value="{{ month }}" pattern="\d{4}-\d{2}" required>
+      </label>
+      <label>CSV 文件（表头：入账月,薪资单号,薪资所属月,流水类型,成本中心,金额分,勘误号,修订号）
+        <input type="file" name="file" accept=".csv,text/csv" required>
+      </label>
+      <button type="submit">上传并替换分区</button>
+      <p class="hint">沿用月明细导出列；上传后整分区被替换、载入代次 +1，旧镜像不保留。无关分区可照常上传。</p>
+    </form>
+    <form method="post" action="{{ url_for('warehouse_preview') }}">
+      <h3>预览整组重装范围</h3>
+      <label>从分区开始双向追查
+        <input name="partition_month" value="{{ month }}" pattern="\d{4}-\d{2}" required>
+      </label>
+      <button type="submit" class="reload-btn">预览重装范围</button>
+      <p class="hint">沿每条错投流水的“实际分区 ↔ 应入账月”双向追查，列出所有相连分区；
+        确认后用对应已封账流水一次替换整组。</p>
+    </form>
+  </div>
+  <table>
+    <thead>
+      <tr><th>分区内#</th><th>应入账月</th><th>薪资单号</th><th>薪资所属月</th><th>流水类型</th>
+          <th>成本中心</th><th>金额（分）</th><th>勘误号</th><th>修订号</th><th>状态</th></tr>
+    </thead>
+    <tbody>
+      {% for r in wh_rows %}
+      <tr class="{{ 'misroute' if r.entry_month != month else '' }}">
+        <td class="num">{{ r.seq }}</td>
+        <td class="mono">{{ r.entry_month }}</td>
+        <td class="mono">{{ r.slip_no }}</td>
+        <td>{{ r.slip_month }}</td>
+        <td>{{ labels.get(r.kind, r.kind) }}</td>
+        <td class="mono">{{ r.cost_center }}</td>
+        <td class="num {{ 'neg' if r.amount_cents < 0 else '' }}">{{ r.amount_cents }}</td>
+        <td class="mono">{{ r.adjust_no or '—' }}</td>
+        <td class="num">{{ r.revision }}</td>
+        <td>
+          {% if r.entry_month != month %}
+            <span class="badge warn-badge">错投 · 应入 {{ r.entry_month }}</span>
+          {% else %}
+            <span class="badge open">正常</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="10" class="empty">该分区尚未载人数仓流水</td></tr>
       {% endfor %}
     </tbody>
   </table>

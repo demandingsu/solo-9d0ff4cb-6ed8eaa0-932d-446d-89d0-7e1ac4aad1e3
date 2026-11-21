@@ -74,6 +74,33 @@
   </div>
 </section>
 
+<section class="grid">
+  <div class="card">
+    <h2>数仓镜像分区</h2>
+    <p class="hint">数仓流水按“实际落入月”存放在镜像分区；行内入账月与分区不一致即为错投。
+      进入分区页可上传替换、预览整组重装。</p>
+    <table>
+      <thead>
+        <tr><th>分区月份</th><th>载入代次</th><th>流水数</th><th>错投数</th><th>最近替换时间</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for p in wh_partitions %}
+        <tr>
+          <td><a href="{{ url_for('month_detail', month=p.month) }}">{{ p.month }}</a></td>
+          <td class="num">{{ p.load_seq }}</td>
+          <td class="num">{{ p.row_count }}</td>
+          <td class="num {{ 'neg' if p.misroute_count else '' }}">{{ p.misroute_count }}</td>
+          <td class="mono">{{ p.updated_at }}</td>
+          <td><a class="btn small" href="{{ url_for('month_detail', month=p.month) }}">分区入口</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="empty">尚未上传过数仓流水</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
 <section class="grid two">
   <div class="card">
     <h2>当前生效薪资单</h2>

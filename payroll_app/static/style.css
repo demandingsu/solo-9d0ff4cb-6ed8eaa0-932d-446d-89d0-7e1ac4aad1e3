@@ -43,6 +43,13 @@ tbody tr:hover { background: #fafbfc; }
 }
 .badge.open { color: var(--ok); background: #e6f4ec; border-color: #bfe3cf; }
 .badge.closed { color: var(--muted); background: #eef0f3; border-color: #dde1e6; }
+.badge.warn-badge { color: var(--warn); background: #fdf6e3; border-color: #ecd9a3; }
+tr.misroute { background: #fff8ec; }
+tr.misroute:hover { background: #fdf2dc; }
+.reload-btn { background: var(--warn); }
+button:disabled { background: #b6bcc4; cursor: not-allowed; }
+.reload-actions { display: flex; gap: 10px; align-items: center; margin-top: 14px; }
+.card h3 { margin: 10px 0 6px; font-size: 14px; color: var(--ink); }
 form.inline { display: inline-flex; gap: 8px; align-items: center; margin: 0; }
 label { display: block; margin: 8px 0; color: var(--muted); }
 input, select {

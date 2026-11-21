@@ -12,9 +12,12 @@
 """
 
 import csv
+import hashlib
 import io
+import json
 import os
 import re
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 
@@ -47,6 +50,13 @@ INT_RE = re.compile(r"^-?\d+$")
 
 ORIGINAL_FIELDS = ["薪资单号", "成本中心", "金额分"]
 ADJUST_FIELDS = ["勘误号", "薪资单号", "成本中心", "金额分"]
+# 数仓流水 CSV 沿用月明细导出的 8 列
+WAREHOUSE_FIELDS = ["入账月", "薪资单号", "薪资所属月", "流水类型", "成本中心",
+                    "金额分", "勘误号", "修订号"]
+# 导出用中文标签 -> 数据库 kind
+KIND_TO_CODE = {label: code for code, label in KIND_LABELS.items()}
+# 兼容直接写英文 kind 的文件
+KIND_TO_CODE.update({code: code for code in KIND_LABELS})
 
 
 class ValidationError(Exception):
@@ -161,6 +171,50 @@ WHEN OLD.status = 'closed' AND NEW.status = 'open'
 BEGIN
     SELECT RAISE(ABORT, 'closed month cannot be reopened');
 END;
+
+-- ============================================================
+-- 数仓镜像：工资流水在数仓侧按“实际落入月（分区）”存放，可能错投。
+-- 分区表记录每个分区的载入代次：每次替换分区 +1，用于识别预览过期。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS wh_partitions (
+    partition_month TEXT PRIMARY KEY,              -- 实际落入月 YYYY-MM
+    load_seq        INTEGER NOT NULL DEFAULT 0,    -- 分区被替换的次数
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL
+);
+
+-- 数仓流水镜像；列与本地封账导出完全一致（“沿用现有列”）
+CREATE TABLE IF NOT EXISTS wh_postings (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    partition_month  TEXT NOT NULL,                -- 实际落入的分区
+    seq              INTEGER NOT NULL,              -- 分区内顺序（按 CSV 行序）
+    entry_month      TEXT NOT NULL,                -- 行内“应入账月”
+    slip_no          TEXT NOT NULL,
+    slip_month       TEXT NOT NULL,
+    kind             TEXT NOT NULL CHECK (kind IN ('original', 'reverse', 'rebook')),
+    cost_center      TEXT NOT NULL,
+    amount_cents     INTEGER NOT NULL,
+    adjust_no        TEXT,
+    revision         INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_wh_partition ON wh_postings(partition_month, seq);
+CREATE INDEX IF NOT EXISTS idx_wh_entry ON wh_postings(entry_month);
+
+-- 重装预览快照；确认时逐项重算比对，任何变化即视为预览过期
+CREATE TABLE IF NOT EXISTS wh_previews (
+    preview_id        TEXT PRIMARY KEY,
+    root_month        TEXT NOT NULL,
+    group_months      TEXT NOT NULL,               -- JSON 数组
+    snapshot          TEXT NOT NULL,               -- JSON：每月 {load_seq, fingerprint, row_count}
+    edge_fp           TEXT NOT NULL,               -- 全组错投边集合指纹
+    row_total         INTEGER NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'open'
+                      CHECK (status IN ('open', 'confirmed', 'expired')),
+    created_at        TEXT NOT NULL,
+    confirmed_at      TEXT
+);
 """
 
 
@@ -611,6 +665,374 @@ def export_csv(conn, month):
     return buf.getvalue()
 
 
+# ============================================================
+# 数仓镜像分区：上传替换、错投双向追查、预览与整组重装
+# ============================================================
+
+class ReloadAbort(Exception):
+    """重装确认失败：整组保留原状。code 对应规定的四类原因。"""
+
+    def __init__(self, code, reason):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+def parse_warehouse_csv(text):
+    """数仓流水 CSV，表头沿用月明细导出的 8 列。整份文件先校验，任一错误全部拒绝。"""
+    if not text.strip():
+        raise ValidationError("CSV 内容为空")
+    reader = csv.reader(io.StringIO(text))
+    _read_header(reader, WAREHOUSE_FIELDS)
+    rows, errors = [], []
+    for lineno, raw in enumerate(reader, start=2):
+        if not raw or all(c.strip() == "" for c in raw):
+            continue
+        if len(raw) != len(WAREHOUSE_FIELDS):
+            errors.append(f"第 {lineno} 行列数为 {len(raw)}，应为 {len(WAREHOUSE_FIELDS)}")
+            continue
+        try:
+            entry_month = _norm_month(raw[0], "入账月")
+            slip_no = _norm_id(raw[1], "薪资单号")
+            slip_month = _norm_month(raw[2], "薪资所属月")
+            kind_label = (raw[3] or "").strip()
+            if kind_label not in KIND_TO_CODE:
+                raise ValidationError(
+                    f"流水类型须为 {'/'.join(KIND_LABELS.values())}：{kind_label!r}"
+                )
+            kind = KIND_TO_CODE[kind_label]
+            cost_center = _norm_center(raw[4])
+            amount_cents = _norm_cents(raw[5])
+            adjust_raw = (raw[6] or "").strip()
+            adjust_no = _norm_id(adjust_raw, "勘误号") if adjust_raw else None
+            revision = _norm_cents(raw[7])
+            if revision < 0:
+                raise ValidationError(f"修订号不能为负：{raw[7]!r}")
+            rows.append({
+                "entry_month": entry_month,
+                "slip_no": slip_no,
+                "slip_month": slip_month,
+                "kind": kind,
+                "cost_center": cost_center,
+                "amount_cents": amount_cents,
+                "adjust_no": adjust_no,
+                "revision": revision,
+                "line": lineno,
+            })
+        except ValidationError as exc:
+            errors.append(f"第 {lineno} 行：{exc}")
+    if errors:
+        raise ValidationError("；".join(errors))
+    if not rows:
+        raise ValidationError("CSV 中没有有效数据行")
+    return rows
+
+
+def replace_wh_partition(conn, partition_month, rows):
+    """用上传的流水整体替换一个数仓分区。单事务，失败则分区保持原样。"""
+    partition_month = _norm_month(partition_month, "实际落入月份")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "DELETE FROM wh_postings WHERE partition_month=?", (partition_month,)
+        )
+        now = _now()
+        for seq, row in enumerate(rows, start=1):
+            conn.execute(
+                "INSERT INTO wh_postings(partition_month, seq, entry_month, slip_no,"
+                " slip_month, kind, cost_center, amount_cents, adjust_no, revision,"
+                " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (partition_month, seq, row["entry_month"], row["slip_no"],
+                 row["slip_month"], row["kind"], row["cost_center"],
+                 row["amount_cents"], row["adjust_no"], row["revision"], now),
+            )
+        conn.execute(
+            "INSERT INTO wh_partitions(partition_month, load_seq, row_count, updated_at)"
+            " VALUES (?, 1, ?, ?)"
+            " ON CONFLICT(partition_month) DO UPDATE SET"
+            " load_seq = wh_partitions.load_seq + 1,"
+            " row_count = excluded.row_count, updated_at = excluded.updated_at",
+            (partition_month, len(rows), now),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return len(rows)
+
+
+def wh_partition_rows(conn, month):
+    return conn.execute(
+        "SELECT * FROM wh_postings WHERE partition_month=? ORDER BY seq", (month,)
+    ).fetchall()
+
+
+def wh_misroute_edges(conn):
+    """错投边：实际分区 <> 行内入账月，按 (分区, 应入账月) 聚合。"""
+    return conn.execute(
+        "SELECT partition_month, entry_month, COUNT(*) AS n FROM wh_postings"
+        " WHERE partition_month <> entry_month"
+        " GROUP BY partition_month, entry_month"
+        " ORDER BY partition_month, entry_month"
+    ).fetchall()
+
+
+def wh_component_months(conn, root):
+    """沿每条错投流水的实际分区与应入账月双向追查，返回 root 所在连通分量。"""
+    adjacency = {}
+    for edge in wh_misroute_edges(conn):
+        adjacency.setdefault(edge["partition_month"], set()).add(edge["entry_month"])
+        adjacency.setdefault(edge["entry_month"], set()).add(edge["partition_month"])
+    seen, stack = {root}, [root]
+    while stack:
+        current = stack.pop()
+        for nxt in adjacency.get(current, ()):  # 无错投的分区只含自身
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return sorted(seen)
+
+
+def _wh_fingerprint(rows):
+    digest = hashlib.sha256()
+    for r in rows:
+        digest.update("\x1f".join([
+            str(r["seq"]), r["entry_month"], r["slip_no"], r["slip_month"],
+            r["kind"], r["cost_center"], str(r["amount_cents"]),
+            r["adjust_no"] or "", str(r["revision"]),
+        ]).encode("utf-8"))
+        digest.update(b"\x1e")
+    return digest.hexdigest()
+
+
+def _edges_fingerprint(edge_rows):
+    digest = hashlib.sha256()
+    for r in sorted(edge_rows, key=lambda x: (x["partition_month"], x["seq"])):
+        digest.update("\x1f".join([
+            r["partition_month"], str(r["seq"]), r["entry_month"], r["slip_no"],
+        ]).encode("utf-8"))
+        digest.update(b"\x1e")
+    return digest.hexdigest()
+
+
+def _group_edge_rows(conn, group):
+    if not group:
+        return []
+    placeholders = ",".join("?" * len(group))
+    return conn.execute(
+        f"SELECT * FROM wh_postings WHERE partition_month <> entry_month"
+        f" AND partition_month IN ({placeholders}) ORDER BY partition_month, seq",
+        group,
+    ).fetchall()
+
+
+def create_wh_preview(conn, root):
+    """选一个分区预览重装范围：求连通分量并冻结快照（代次 + 内容指纹 + 错投边）。"""
+    root = _norm_month(root, "预览分区")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        group = wh_component_months(conn, root)
+        snapshot = {}
+        for month in group:
+            rows = wh_partition_rows(conn, month)
+            prow = conn.execute(
+                "SELECT * FROM wh_partitions WHERE partition_month=?", (month,)
+            ).fetchone()
+            snapshot[month] = {
+                "load_seq": prow["load_seq"] if prow else 0,
+                "row_count": len(rows),
+                "fingerprint": _wh_fingerprint(rows),
+            }
+        edge_rows = _group_edge_rows(conn, group)
+        preview_id = secrets.token_hex(8)
+        now = _now()
+        conn.execute(
+            "INSERT INTO wh_previews(preview_id, root_month, group_months, snapshot,"
+            " edge_fp, row_total, status, created_at)"
+            " VALUES (?,?,?,?,?,?,'open',?)",
+            (preview_id, root,
+             json.dumps(group, ensure_ascii=False),
+             json.dumps(snapshot, ensure_ascii=False),
+             _edges_fingerprint(edge_rows),
+             sum(item["row_count"] for item in snapshot.values()), now),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return get_wh_preview(conn, preview_id)
+
+
+def get_wh_preview(conn, preview_id):
+    return conn.execute(
+        "SELECT * FROM wh_previews WHERE preview_id=?", (preview_id,)
+    ).fetchone()
+
+
+def _validate_preview(conn, preview):
+    """只读复核预览是否仍可执行。失败抛 ReloadAbort，返回 (组, 快照)。"""
+    saved_group = json.loads(preview["group_months"])
+    saved_snapshot = json.loads(preview["snapshot"])
+    root = preview["root_month"]
+
+    # 1) 重算连通分量：组外分区被错投连进来（或原有分区脱离）-> 拒绝
+    current_group = wh_component_months(conn, root)
+    if current_group != saved_group:
+        joined = sorted(set(current_group) - set(saved_group))
+        dropped = sorted(set(saved_group) - set(current_group))
+        details = []
+        if joined:
+            details.append("把组外分区连进来的错投：" + "、".join(joined))
+        if dropped:
+            details.append("原组内分区已脱离：" + "、".join(dropped))
+        raise ReloadAbort(
+            "outside_connected",
+            "预览后错投连接关系变化（" + "；".join(details) + "），整组保留原状"
+        )
+
+    # 2) 逐分区比对载入代次与内容指纹：预览后被替换/改动 -> 预览过期
+    for month in saved_group:
+        prow = conn.execute(
+            "SELECT * FROM wh_partitions WHERE partition_month=?", (month,)
+        ).fetchone()
+        current_seq = prow["load_seq"] if prow else 0
+        saved = saved_snapshot[month]
+        if current_seq != saved["load_seq"]:
+            raise ReloadAbort(
+                "stale_preview",
+                f"预览后分区 {month} 已被替换（载入代次 {saved['load_seq']} → "
+                f"{current_seq}），预览已过期，整组保留原状"
+            )
+        rows = wh_partition_rows(conn, month)
+        if (len(rows) != saved["row_count"]
+                or _wh_fingerprint(rows) != saved["fingerprint"]):
+            raise ReloadAbort(
+                "stale_preview",
+                f"预览后分区 {month} 内容发生变化，预览已过期，整组保留原状"
+            )
+
+    # 3) 组内错投边整体指纹
+    if _edges_fingerprint(_group_edge_rows(conn, saved_group)) != preview["edge_fp"]:
+        raise ReloadAbort(
+            "stale_preview", "预览后组内错投流水发生变化，预览已过期，整组保留原状"
+        )
+
+    # 4) 每个分区都必须有对应的已封账月（封账流水是唯一允许的替换源）
+    missing, not_closed = [], []
+    for month in saved_group:
+        mrow = get_month(conn, month)
+        if mrow is None:
+            missing.append(month)
+        elif mrow["status"] != "closed":
+            not_closed.append(month)
+    if missing:
+        raise ReloadAbort(
+            "missing_closed",
+            "分区缺少对应的已封账月，无封账流水可用于替换：" + "、".join(missing)
+            + "，整组保留原状"
+        )
+    if not_closed:
+        raise ReloadAbort(
+            "missing_closed",
+            "以下月份尚未封账，不能作为重装数据源：" + "、".join(not_closed)
+            + "，整组保留原状"
+        )
+    return saved_group, saved_snapshot
+
+
+def preview_block_reason(conn, preview):
+    """供预览页展示：区分“预览过期”与“前置条件不满足”，返回 (类别, 原因) 或 None。"""
+    try:
+        _validate_preview(conn, preview)
+    except ReloadAbort as exc:
+        if exc.code == "missing_closed":
+            return "blocked", exc.reason
+        return "stale", exc.reason
+    return None
+
+
+def confirm_wh_reload(conn, preview_id):
+    """确认重装：全部校验通过后，单事务用封账流水一次替换整组。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        preview = conn.execute(
+            "SELECT * FROM wh_previews WHERE preview_id=?", (preview_id,)
+        ).fetchone()
+        if preview is None:
+            raise ReloadAbort("missing_preview", "预览不存在或已失效，请重新选择分区预览")
+        if preview["status"] != "open":
+            raise ReloadAbort(
+                "preview_consumed", "该预览已确认过，不能重复执行；请重新选择分区预览"
+            )
+        group, snapshot = _validate_preview(conn, preview)
+
+        now = _now()
+        replaced = []
+        for month in group:
+            canonical = month_rows(conn, month)  # 本地已封账流水
+            conn.execute(
+                "DELETE FROM wh_postings WHERE partition_month=?", (month,)
+            )
+            for seq, r in enumerate(canonical, start=1):
+                conn.execute(
+                    "INSERT INTO wh_postings(partition_month, seq, entry_month, slip_no,"
+                    " slip_month, kind, cost_center, amount_cents, adjust_no, revision,"
+                    " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (month, seq, r["entry_month"], r["slip_no"], r["slip_month"],
+                     r["kind"], r["cost_center"], r["amount_cents"], r["adjust_no"],
+                     r["revision"], now),
+                )
+            conn.execute(
+                "INSERT INTO wh_partitions(partition_month, load_seq, row_count, updated_at)"
+                " VALUES (?, 1, ?, ?)"
+                " ON CONFLICT(partition_month) DO UPDATE SET"
+                " load_seq = wh_partitions.load_seq + 1,"
+                " row_count = excluded.row_count, updated_at = excluded.updated_at",
+                (month, len(canonical), now),
+            )
+            replaced.append({
+                "month": month,
+                "old_rows": snapshot[month]["row_count"],
+                "new_rows": len(canonical),
+            })
+        conn.execute(
+            "UPDATE wh_previews SET status='confirmed', confirmed_at=?"
+            " WHERE preview_id=?",
+            (now, preview_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return {
+        "preview_id": preview_id,
+        "root": preview["root_month"],
+        "group": group,
+        "replaced": replaced,
+        "confirmed_at": now,
+    }
+
+
+def wh_partition_summary(conn):
+    out = []
+    for p in conn.execute(
+        "SELECT * FROM wh_partitions ORDER BY partition_month"
+    ).fetchall():
+        mis = conn.execute(
+            "SELECT COUNT(*) AS n FROM wh_postings"
+            " WHERE partition_month=? AND entry_month<>?",
+            (p["partition_month"], p["partition_month"]),
+        ).fetchone()["n"]
+        out.append({
+            "month": p["partition_month"],
+            "load_seq": p["load_seq"],
+            "row_count": p["row_count"],
+            "misroute_count": mis,
+            "updated_at": p["updated_at"],
+        })
+    return out
+
+
 # ------------------------------------------------------------------ 应用
 
 def create_app(db_path=None, testing=False):
@@ -651,6 +1073,7 @@ def create_app(db_path=None, testing=False):
             open_months=[m["month"] for m in summary if m["status"] == "open"],
             adjustments=adjustment_history(conn),
             slips=slip_rows(conn),
+            wh_partitions=wh_partition_summary(conn),
         )
 
     @app.post("/months/open")
@@ -729,16 +1152,121 @@ def create_app(db_path=None, testing=False):
         except ValidationError as exc:
             flash(str(exc), "error")
             return redirect(url_for("index"))
-        if get_month(conn, month) is None:
-            flash(f"月份 {month} 不存在", "error")
+        info = get_month(conn, month)
+        wh_info = conn.execute(
+            "SELECT * FROM wh_partitions WHERE partition_month=?", (month,)
+        ).fetchone()
+        if info is None and wh_info is None:
+            flash(f"月份 {month} 在本地账与数仓镜像中均不存在", "error")
             return redirect(url_for("index"))
+        wh_rows = wh_partition_rows(conn, month)
         return render_template(
             "month.html",
             month=month,
-            info=get_month(conn, month),
-            rows=month_rows(conn, month),
+            info=info,
+            rows=month_rows(conn, month) if info is not None else [],
+            wh_info=wh_info,
+            wh_rows=wh_rows,
+            wh_misroute_count=sum(1 for r in wh_rows if r["entry_month"] != month),
             labels=KIND_LABELS,
         )
+
+    @app.post("/warehouse/upload")
+    def warehouse_upload():
+        """上传数仓流水 CSV，替换所选实际落入月的本地镜像分区。"""
+        conn = get_db()
+        month = request.form.get("partition_month", "")
+        upload = request.files.get("file")
+        try:
+            if upload is None or not upload.filename:
+                raise ValidationError("请选择 CSV 文件")
+            text = upload.read().decode("utf-8-sig")
+            rows = parse_warehouse_csv(text)
+            n = replace_wh_partition(conn, month, rows)
+            flash(
+                f"数仓分区 {month.strip()} 已整体替换：载入 {n} 条流水"
+                f"（载入代次 +1）",
+                "ok",
+            )
+        except (ValidationError, ConflictError, sqlite3.IntegrityError) as exc:
+            flash(f"分区上传失败，原分区保持不变：{exc}", "error")
+        except UnicodeDecodeError:
+            flash("分区上传失败，原分区保持不变：文件必须为 UTF-8 编码", "error")
+        target = month.strip()
+        if MONTH_RE.match(target):
+            return redirect(url_for("month_detail", month=target))
+        return redirect(url_for("index"))
+
+    @app.post("/warehouse/preview")
+    def warehouse_preview():
+        """选一个分区，双向追查错投并冻结整组重装范围。"""
+        conn = get_db()
+        month = request.form.get("partition_month", "")
+        try:
+            month = _norm_month(month, "预览分区")
+            preview = create_wh_preview(conn, month)
+            return redirect(url_for("warehouse_preview_view",
+                                    preview_id=preview["preview_id"]))
+        except (ValidationError, sqlite3.IntegrityError) as exc:
+            flash(f"无法生成预览：{exc}", "error")
+        return redirect(url_for("month_detail", month=month.strip())
+                        if MONTH_RE.match(month.strip()) else url_for("index"))
+
+    @app.get("/warehouse/preview/<preview_id>")
+    def warehouse_preview_view(preview_id):
+        conn = get_db()
+        preview = get_wh_preview(conn, preview_id)
+        if preview is None:
+            flash("预览不存在或已失效，请重新选择分区预览", "error")
+            return redirect(url_for("index"))
+        group = json.loads(preview["group_months"])
+        snapshot = json.loads(preview["snapshot"])
+        members = []
+        for m in group:
+            mrow = get_month(conn, m)
+            prow = conn.execute(
+                "SELECT * FROM wh_partitions WHERE partition_month=?", (m,)
+            ).fetchone()
+            members.append({
+                "month": m,
+                "book_status": mrow["status"] if mrow is not None else "missing",
+                "load_seq": snapshot[m]["load_seq"],
+                "row_count": snapshot[m]["row_count"],
+                "current_seq": prow["load_seq"] if prow else 0,
+            })
+        edge_rows = _group_edge_rows(conn, group)
+        block = None
+        if preview["status"] == "open":
+            block = preview_block_reason(conn, preview)
+        return render_template(
+            "reload_preview.html",
+            preview=preview,
+            group=group,
+            members=members,
+            snapshot=snapshot,
+            edge_rows=edge_rows,
+            block=block,
+            labels=KIND_LABELS,
+        )
+
+    @app.post("/warehouse/reload/<preview_id>")
+    def warehouse_reload(preview_id):
+        conn = get_db()
+        try:
+            result = confirm_wh_reload(conn, preview_id)
+            flash(
+                "整组重装完成：分区 " + "、".join(result["group"])
+                + " 已用对应封账流水一次替换",
+                "ok",
+            )
+            return render_template(
+                "reload_result.html", result=result, labels=KIND_LABELS
+            )
+        except ReloadAbort as exc:
+            flash(f"整组重装未执行，所有分区保留原状：{exc.reason}", "error")
+        except (sqlite3.Error, ValidationError) as exc:
+            flash(f"写入失败，整组保留原状：{exc}", "error")
+        return redirect(url_for("warehouse_preview_view", preview_id=preview_id))
 
     @app.get("/export/<month>.csv")
     def export(month):
